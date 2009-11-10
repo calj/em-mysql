@@ -4,6 +4,7 @@ require 'mysqlplus'
 require 'fcntl'
 
 class Mysql
+  attr_accessor :db
   def result
     @cur_result
   end
@@ -15,7 +16,7 @@ class EventedMysql < EM::Connection
     @fd = mysql.socket
     @opts = opts
     @current = nil
-    @@queue ||= []
+    @@queue ||= {}
     @processing = false
     @connected = true
 
@@ -37,7 +38,7 @@ class EventedMysql < EM::Connection
     log 'readable'
     if item = @current
       @current = nil
-      start, response, sql, cblk, eblk = item
+      start, db, response, sql, cblk, eblk = item
       log 'mysql response', Time.now-start, sql
       arg = case response
             when :raw
@@ -73,11 +74,11 @@ class EventedMysql < EM::Connection
   rescue Mysql::Error => e
     log 'mysql error', e.message
     if e.message =~ /Deadlock/
-      @@queue << [response, sql, cblk, eblk]
+      @@queue[db] << [db, response, sql, cblk, eblk]
       @processing = false
       next_query
     elsif DisconnectErrors.include? e.message
-      @@queue << [response, sql, cblk, eblk]
+      @@queue[db] << [db, response, sql, cblk, eblk]
       return close
     elsif cb = (eblk || @opts[:on_error])
       cb.call(e)
@@ -122,6 +123,7 @@ class EventedMysql < EM::Connection
 
   def execute sql, response = nil, cblk = nil, eblk = nil, &blk
     cblk ||= blk
+    @@queue[@mysql.db] ||= []
 
     begin
       unless @processing or !@connected
@@ -131,7 +133,7 @@ class EventedMysql < EM::Connection
         #   # log 'mysql errno', @mysql.errno
         # rescue
         #   log 'mysql ping failed'
-        #   @@queue << [response, sql, blk]
+        #   @@queue[db] << [db, response, sql, blk]
         #   return close
         # end
 
@@ -140,13 +142,13 @@ class EventedMysql < EM::Connection
         log 'mysql sending', sql
         @mysql.send_query(sql)
       else
-        @@queue << [response, sql, cblk, eblk]
+        @@queue[@mysql.db] << [@mysql.db, response, sql, cblk, eblk]
         return
       end
     rescue Mysql::Error => e
       log 'mysql error', e.message
       if DisconnectErrors.include? e.message
-        @@queue << [response, sql, cblk, eblk]
+        @@queue[@mysql.db] << [@mysql.db, response, sql, cblk, eblk]
         return close
       else
         raise e
@@ -154,7 +156,7 @@ class EventedMysql < EM::Connection
     end
 
     log 'queuing', response, sql
-    @current = [Time.now, response, sql, cblk, eblk]
+    @current = [Time.now, @mysql.db, response, sql, cblk, eblk]
   end
   
   def close
@@ -166,8 +168,9 @@ class EventedMysql < EM::Connection
   private
 
   def next_query
-    if @connected and !@processing and pending = @@queue.shift
-      response, sql, cblk, eblk = pending
+    @@queue[@mysql.db] ||= []
+    if @connected and !@processing and pending = @@queue[@mysql.db].shift
+      db, response, sql, cblk, eblk = pending
       execute(sql, response, cblk, eblk)
     end
   end
@@ -179,12 +182,13 @@ class EventedMysql < EM::Connection
 
   public
 
-  def self.connect opts
-    unless EM.respond_to?(:watch) and Mysql.method_defined?(:socket)
-      raise RuntimeError, 'mysqlplus and EM.watch are required for EventedMysql'
+  def self.connect opts, db = :default
+    unless EM.respond_to?(:attach) and Mysql.method_defined?(:socket)
+      raise RuntimeError, 'mysqlplus and EM.attach are required for EventedMysql'
     end
 
     if conn = _connect(opts)
+      conn.db = db
       EM.watch conn.socket, self, conn, opts
     else
       EM.add_timer(5){ connect opts }
@@ -256,8 +260,8 @@ class EventedMysql
   def self.execute query, type = nil, cblk = nil, eblk = nil, &blk
     unless nil#connection = connection_pool.find{|c| not c.processing and c.connected }
       @n ||= 0
-      connection = connection_pool[@n]
-      @n = 0 if (@n+=1) >= connection_pool.size
+      connection = connection_pool(@mysql.db)[@n]
+      @n = 0 if (@n+=1) >= connection_pool(@mysql.db).size
     end
 
     connection.execute(query, type, cblk, eblk, &blk)
@@ -271,18 +275,19 @@ class EventedMysql
 
   ] end
 
-  def self.all query, type = nil, &blk
+  def self.all db, query, type = nil, &blk
     responses = 0
-    connection_pool.each do |c|
+    connection_pool(db).each do |c|
       c.execute(query, type) do
         responses += 1
-        blk.call if blk and responses == @connection_pool.size
+        blk.call if blk and responses == @connection_pool[db].size
       end
     end
   end
 
-  def self.connection_pool
-    @connection_pool ||= (1..settings[:connections]).map{ EventedMysql.connect(settings) }
+  def self.connection_pool db
+    @connection_pool ||= {}
+    @connection_pool[db] ||= (1..settings[:connections]).map{ EventedMysql.connect(db, settings) }
     # p ['connpool', settings[:connections], @connection_pool.size]
     # (1..(settings[:connections]-@connection_pool.size)).each do
     #   @connection_pool << EventedMysql.connect(settings)
